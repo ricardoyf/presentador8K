@@ -1,3 +1,2 @@
 #!/bin/sh
 exec /usr/bin/python3 "@APP_DIR@/presentador_fotos.py" "$@"
-

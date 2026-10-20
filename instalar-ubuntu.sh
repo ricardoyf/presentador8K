@@ -20,4 +20,3 @@ gio set "$DESKTOP_DIR/Presentador Fotos NAS.desktop" metadata::trusted true 2>/d
 update-desktop-database "$APPLICATIONS_DIR" 2>/dev/null || true
 
 printf '%s\n' "Instalado PresentadorFotos NAS. Acceso directo: $DESKTOP_DIR/Presentador Fotos NAS.desktop"
-
