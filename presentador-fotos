@@ -1,2 +1,13 @@
 #!/bin/sh
-exec /usr/bin/python3 "@APP_DIR@/presentador_fotos.py" "$@"
+APP="@APP_DIR@/presentador_fotos.py"
+
+# Deja siempre prioridad al escritorio y protege el equipo ante fotos enormes.
+if command -v systemd-run >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    exec systemd-run --user --scope --quiet \
+        -p CPUQuota=70% \
+        -p MemoryHigh=600M \
+        -p MemoryMax=850M \
+        /usr/bin/nice -n 10 /usr/bin/python3 "$APP" "$@"
+fi
+
+exec /usr/bin/nice -n 10 /usr/bin/python3 "$APP" "$@"
