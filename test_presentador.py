@@ -4,7 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from presentador_fotos import RandomDeck, photo_year_month, selected_photos
+from presentador_fotos import (
+    MAX_RENDER_HEIGHT,
+    MAX_RENDER_WIDTH,
+    RandomDeck,
+    photo_year_month,
+    render_size,
+    selected_photos,
+)
 
 
 class PresentadorTests(unittest.TestCase):
@@ -35,6 +42,10 @@ class PresentadorTests(unittest.TestCase):
         deck = RandomDeck(photos, random.Random(7))
         first = deck.draw(4) + deck.draw(4) + deck.draw(2)
         self.assertEqual(len(set(first)), 10)
+
+    def test_render_no_supera_limite_de_recursos(self):
+        self.assertEqual(render_size(7680, 4320), (MAX_RENDER_WIDTH, MAX_RENDER_HEIGHT))
+        self.assertEqual(render_size(800, 600), (800, 600))
 
 
 if __name__ == "__main__":

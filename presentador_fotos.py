@@ -21,7 +21,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 APP_ID = "local.ricardo.PresentadorFotosNAS"
 DEFAULT_URI = "smb://dsplay214.local/photo/"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "presentador-fotos/config.json"
@@ -30,6 +30,9 @@ MONTHS = [
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
 ]
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+MAX_RENDER_WIDTH = 1920
+MAX_RENDER_HEIGHT = 1080
+MAX_HISTORY = 40
 NAME_FILTER = re.compile(r"(?:copia|enc)", re.IGNORECASE)
 DATE_IN_NAME = re.compile(r"(?<!\d)(?P<year>(?:19|20)\d{2})[-_.]?(?P<month>0[1-9]|1[0-2])[-_.]?(?:0[1-9]|[12]\d|3[01])(?!\d)")
 YEAR_PART = re.compile(r"^(?:19|20)\d{2}$")
@@ -107,13 +110,21 @@ class RandomDeck:
         return result
 
 
+def render_size(width: int, height: int) -> tuple[int, int]:
+    """Limita el trabajo de decodificacion a lo que realmente puede verse."""
+    return (
+        max(1, min(width, MAX_RENDER_WIDTH)),
+        max(1, min(height, MAX_RENDER_HEIGHT)),
+    )
+
+
 def load_pixbuf(path: Path, width: int, height: int) -> GdkPixbuf.Pixbuf:
-    pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(path))
-    pixbuf = pixbuf.apply_embedded_orientation()
-    ratio = min(width / pixbuf.get_width(), height / pixbuf.get_height())
-    width = max(1, round(pixbuf.get_width() * ratio))
-    height = max(1, round(pixbuf.get_height() * ratio))
-    return pixbuf.scale_simple(width, height, GdkPixbuf.InterpType.BILINEAR)
+    """Decodifica ya reducida; nunca crea primero el bitmap original gigante."""
+    width, height = render_size(width, height)
+    pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+        str(path), width, height, True,
+    )
+    return pixbuf.apply_embedded_orientation()
 
 
 class Slideshow(Gtk.Window):
@@ -124,7 +135,7 @@ class Slideshow(Gtk.Window):
         self.modify_bg(Gtk.StateType.NORMAL, Gdk.color_parse("black"))
         self.connect("key-press-event", self.on_key)
         self.connect("button-press-event", lambda *_: self.next_group())
-        self.connect("destroy", Gtk.main_quit)
+        self.connect("destroy", self.on_destroy)
         self.duration_ms = max(250, round(duration * 1000))
         self.count = count
         self.deck = RandomDeck(photos)
@@ -132,6 +143,8 @@ class Slideshow(Gtk.Window):
         self.position = -1
         self.paused = False
         self.timer_id = 0
+        self.resize_id = 0
+        self.last_render_size = (0, 0)
         self.grid = Gtk.Grid(row_homogeneous=True, column_homogeneous=True)
         self.grid.set_row_spacing(4)
         self.grid.set_column_spacing(4)
@@ -142,8 +155,29 @@ class Slideshow(Gtk.Window):
         GLib.idle_add(self.next_group)
 
     def on_resize(self, *_):
+        if self.position < 0:
+            return
+        allocation = self.get_allocation()
+        size = render_size(allocation.width, allocation.height)
+        if size == self.last_render_size:
+            return
+        if self.resize_id:
+            GLib.source_remove(self.resize_id)
+        self.resize_id = GLib.timeout_add(300, self.render_after_resize)
+
+    def render_after_resize(self):
+        self.resize_id = 0
         if self.position >= 0:
             self.render(self.history[self.position])
+        return GLib.SOURCE_REMOVE
+
+    def on_destroy(self, *_):
+        if self.timer_id:
+            GLib.source_remove(self.timer_id)
+            self.timer_id = 0
+        if self.resize_id:
+            GLib.source_remove(self.resize_id)
+            self.resize_id = 0
 
     def render(self, paths: list[Path]):
         for child in self.grid.get_children():
@@ -153,6 +187,7 @@ class Slideshow(Gtk.Window):
         rows = 2 if self.count == 4 else 1
         cell_width = max(100, allocation.width // columns - 8)
         cell_height = max(100, allocation.height // rows - 8)
+        self.last_render_size = render_size(allocation.width, allocation.height)
         for index, path in enumerate(paths):
             frame = Gtk.EventBox()
             frame.modify_bg(Gtk.StateType.NORMAL, Gdk.color_parse("black"))
@@ -177,6 +212,10 @@ class Slideshow(Gtk.Window):
         else:
             self.history.append(self.deck.draw(self.count))
             self.position += 1
+            if len(self.history) > MAX_HISTORY:
+                excess = len(self.history) - MAX_HISTORY
+                del self.history[:excess]
+                self.position -= excess
         self.render(self.history[self.position])
         if not self.paused:
             self.schedule()
@@ -269,16 +308,16 @@ class PresentadorApp(Gtk.Application):
 
         options = Gtk.Box(spacing=24)
         options.pack_start(Gtk.Label(label="Segundos por pase:"), False, False, 0)
-        self.duration = Gtk.SpinButton.new_with_range(0.5, 120, 0.5)
+        self.duration = Gtk.SpinButton.new_with_range(2, 120, 0.5)
         self.duration.set_digits(1)
-        self.duration.set_value(float(saved.get("duration", 3)))
+        self.duration.set_value(max(2, float(saved.get("duration", 5))))
         options.pack_start(self.duration, False, False, 0)
         self.four = Gtk.CheckButton(label="Mostrar 4 fotos a la vez")
         self.four.set_active(bool(saved.get("four", False)))
         options.pack_start(self.four, False, False, 0)
         box.pack_start(options, False, False, 0)
 
-        box.pack_start(Gtk.Label(label="Orden aleatorio global: no repite fotos hasta recorrer toda la selección.", xalign=0), False, False, 0)
+        box.pack_start(Gtk.Label(label="Modo ligero: imágenes adaptadas a pantalla y recursos limitados.", xalign=0), False, False, 0)
         self.status = Gtk.Label(label="Selecciona año y meses y pulsa Iniciar presentación.", xalign=0)
         self.status.set_line_wrap(True)
         box.pack_start(self.status, True, True, 0)
