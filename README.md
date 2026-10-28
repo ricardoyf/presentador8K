@@ -1,6 +1,6 @@
-# PresentadorFotos NAS
+# PresentadorFotos NAS v2.4
 
-Presentador de fotos para Ubuntu pensado para la biblioteca del NAS de Ricardo.
+Presentador de fotos para Ubuntu y Windows pensado para la biblioteca del NAS de Ricardo.
 
 - Fuente predeterminada: `smb://dsplay214.local/photo/`.
 - Busca recursivamente fotos cuyo nombre contenga `copia` o `ENC` (sin distinguir mayusculas).
@@ -25,9 +25,9 @@ Presentador de fotos para Ubuntu pensado para la biblioteca del NAS de Ricardo.
 - `F` o `F11`: alterna pantalla completa.
 - `Esc` o `Q`: cierra el pase.
 
-## Comportamiento de la v2.3
+## Comportamiento de la v2.4
 
-Al pulsar Iniciar, el programa termina primero el indice de todo el intervalo elegido. Puede tardar unos segundos si el NAS contiene muchas fotos, pero evita que la presentacion avance por bloques de enero, febrero, marzo, etc. Una vez terminado el indice, mezcla la coleccion completa y abre el pase a pantalla completa.
+Los años se indexan en paralelo. El pase comienza al disponer de una reserva inicial y los lotes posteriores se incorporan ya barajados, reduciendo la espera del NAS sin recorrer los años secuencialmente.
 
 ## Instalacion
 
@@ -38,3 +38,11 @@ Al pulsar Iniciar, el programa termina primero el indice de todo el intervalo el
 El instalador crea el comando `presentador-fotos` y el acceso directo `Presentador Fotos NAS` en el escritorio y en el menu de aplicaciones.
 
 Requisitos de Ubuntu: Python 3, PyGObject/GTK 3 y GdkPixbuf (incluidos habitualmente en Ubuntu).
+
+## Instalacion en Windows
+
+1. Descargar o clonar el repositorio.
+2. Ejecutar `instalar-windows.bat`.
+3. Abrir `Presentador Fotos NAS` desde el acceso directo del Escritorio.
+
+El instalador requiere Python 3 y añade Pillow y `pillow-heif`. La aplicacion permite elegir una carpeta local, una unidad de red o una ruta UNC (`\\servidor\\carpeta`). La configuracion se guarda en `%APPDATA%\\PresentadorFotosNAS`.
