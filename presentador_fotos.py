@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""PresentadorFotos NAS: pase aleatorio global de una o cuatro fotos."""
+"""PresentadorFotos NAS: pase aleatorio ligero para una foto o mosaicos Full HD."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import random
 import re
 import sys
 import threading
+import time
 
 import gi
 
@@ -21,18 +22,18 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 
-APP_VERSION = "1.1"
+APP_VERSION = "2.3"
 APP_ID = "local.ricardo.PresentadorFotosNAS"
 DEFAULT_URI = "smb://dsplay214.local/photo/"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "presentador-fotos/config.json"
-MONTHS = [
-    "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
-]
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 MAX_RENDER_WIDTH = 1920
 MAX_RENDER_HEIGHT = 1080
 MAX_HISTORY = 40
+DISPLAY_MODES = {
+    "single": ("1 foto", 1, 1),
+    "grid2x2": ("4 fotos — mosaico 2×2 Full HD", 2, 2),
+}
 NAME_FILTER = re.compile(r"(?:copia|enc)", re.IGNORECASE)
 DATE_IN_NAME = re.compile(r"(?<!\d)(?P<year>(?:19|20)\d{2})[-_.]?(?P<month>0[1-9]|1[0-2])[-_.]?(?:0[1-9]|[12]\d|3[01])(?!\d)")
 YEAR_PART = re.compile(r"^(?:19|20)\d{2}$")
@@ -64,24 +65,33 @@ def photo_year_month(path: Path, root: Path) -> tuple[int, int] | None:
     return None
 
 
-def selected_photos(root: Path, year: int, months: set[int]) -> list[Path]:
-    """Escanea una vez y devuelve el conjunto global de fotos validas."""
-    year_root = root / str(year)
-    scan_root = year_root if year_root.is_dir() else root
-    found: list[Path] = []
-
+def iter_selected_photos(root: Path, year_from: int, year_to: int):
+    """Entrega fotos a medida que aparecen, sin esperar a recorrer todo el NAS."""
     def scan_error(error: OSError) -> None:
         raise error
 
-    for base, _, files in os.walk(scan_root, onerror=scan_error):
-        for name in files:
-            path = Path(base) / name
-            if path.suffix.lower() not in PHOTO_EXTS or not NAME_FILTER.search(path.stem):
-                continue
-            stamp = photo_year_month(path, root)
-            if stamp and stamp[0] == year and stamp[1] in months:
-                found.append(path)
-    return sorted(set(found), key=lambda item: str(item).casefold())
+    # Las carpetas del NAS estan organizadas por ano. Recorrer solo las del
+    # intervalo evita escanear toda la fototeca y permite empezar pronto.
+    scan_roots = [root / str(year) for year in range(year_from, year_to + 1)]
+    scan_roots = [path for path in scan_roots if path.is_dir()]
+    if not scan_roots:
+        scan_roots = [root]
+    seen: set[Path] = set()
+    for scan_root in scan_roots:
+        for base, _, files in os.walk(scan_root, onerror=scan_error):
+            for name in files:
+                path = Path(base) / name
+                if path in seen or path.suffix.lower() not in PHOTO_EXTS or not NAME_FILTER.search(path.stem):
+                    continue
+                stamp = photo_year_month(path, root)
+                if stamp and year_from <= stamp[0] <= year_to:
+                    seen.add(path)
+                    yield path
+
+
+def selected_photos(root: Path, year_from: int, year_to: int) -> list[Path]:
+    """Compatibilidad con el modo de diagnostico por consola."""
+    return list(iter_selected_photos(root, year_from, year_to))
 
 
 class RandomDeck:
@@ -91,22 +101,42 @@ class RandomDeck:
         if not photos:
             raise ValueError("La baraja necesita al menos una foto.")
         self.photos = list(photos)
+        self.known = set(photos)
         self.rng = rng or random.Random()
         self.remaining: list[Path] = []
         self.last: Path | None = None
+        self.last_group: set[Path] = set()
+
+    def add(self, photos: list[Path]):
+        """Amplia la baraja mientras el escaneo sigue trabajando en segundo plano."""
+        for photo in photos:
+            if photo not in self.known:
+                self.known.add(photo)
+                self.photos.append(photo)
+                self.remaining.append(photo)
 
     def draw(self, amount: int) -> list[Path]:
         result: list[Path] = []
-        while len(result) < min(amount, len(self.photos)):
+        target = min(amount, len(self.photos))
+        attempts = 0
+        while len(result) < target:
             if not self.remaining:
                 self.remaining = self.photos.copy()
                 self.rng.shuffle(self.remaining)
-                if self.last and len(self.remaining) > 1 and self.remaining[-1] == self.last:
-                    self.remaining[0], self.remaining[-1] = self.remaining[-1], self.remaining[0]
             candidate = self.remaining.pop()
-            if candidate not in result:
+            # Prohibido repetir dentro de la pantalla. Si hay suficientes
+            # fotos, tampoco se reutiliza ninguna de la pantalla anterior.
+            avoid_previous = len(self.photos) >= amount * 2
+            if candidate not in result and (not avoid_previous or candidate not in self.last_group):
                 result.append(candidate)
+                attempts = 0
+            else:
+                self.remaining.insert(0, candidate)
+                attempts += 1
+                if attempts > len(self.photos) * 2:
+                    avoid_previous = False
         self.last = result[-1]
+        self.last_group = set(result)
         return result
 
 
@@ -127,9 +157,9 @@ def load_pixbuf(path: Path, width: int, height: int) -> GdkPixbuf.Pixbuf:
     return pixbuf.apply_embedded_orientation()
 
 
-class Slideshow(Gtk.Window):
-    def __init__(self, photos: list[Path], duration: float, count: int):
-        super().__init__(title=f"PresentadorFotos NAS v{APP_VERSION}")
+class Slideshow(Gtk.ApplicationWindow):
+    def __init__(self, application, photos: list[Path], duration: float, mode: str, session_minutes: int):
+        super().__init__(application=application, title=f"PresentadorFotos NAS v{APP_VERSION}")
         self.set_icon_name("image-x-generic")
         self.set_decorated(False)
         self.modify_bg(Gtk.StateType.NORMAL, Gdk.color_parse("black"))
@@ -137,22 +167,61 @@ class Slideshow(Gtk.Window):
         self.connect("button-press-event", lambda *_: self.next_group())
         self.connect("destroy", self.on_destroy)
         self.duration_ms = max(250, round(duration * 1000))
-        self.count = count
+        _label, self.columns, self.rows = DISPLAY_MODES.get(mode, DISPLAY_MODES["single"])
+        self.count = self.columns * self.rows
         self.deck = RandomDeck(photos)
         self.history: list[list[Path]] = []
         self.position = -1
         self.paused = False
         self.timer_id = 0
+        self.countdown_id = 0
+        self.ends_at = time.monotonic() + max(1, session_minutes) * 60
         self.resize_id = 0
         self.last_render_size = (0, 0)
         self.grid = Gtk.Grid(row_homogeneous=True, column_homogeneous=True)
         self.grid.set_row_spacing(4)
         self.grid.set_column_spacing(4)
-        self.add(self.grid)
+        overlay = Gtk.Overlay()
+        overlay.add(self.grid)
+        self.countdown = Gtk.Label()
+        self.countdown.set_halign(Gtk.Align.END)
+        self.countdown.set_valign(Gtk.Align.START)
+        self.countdown.set_margin_top(10)
+        self.countdown.set_margin_end(14)
+        self.countdown.set_name("countdown")
+        overlay.add_overlay(self.countdown)
+        self.add(overlay)
         self.connect("size-allocate", self.on_resize)
         self.fullscreen()
         self.show_all()
+        self.present()
+        GLib.idle_add(self.hide_pointer)
         GLib.idle_add(self.next_group)
+        self.update_countdown()
+        self.countdown_id = GLib.timeout_add_seconds(1, self.update_countdown)
+
+    def update_countdown(self):
+        remaining = max(0, int(self.ends_at - time.monotonic() + 0.999))
+        hours, remainder = divmod(remaining, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.countdown.set_markup(
+            f'<span foreground="white" background="#80000000" size="large">  {hours:02d}:{minutes:02d}:{seconds:02d}  </span>'
+        )
+        if remaining <= 0:
+            self.close()
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    def hide_pointer(self):
+        """Oculta el puntero durante el pase; vuelve al cerrar la ventana."""
+        window = self.get_window()
+        if window:
+            cursor = Gdk.Cursor.new_for_display(window.get_display(), Gdk.CursorType.BLANK_CURSOR)
+            window.set_cursor(cursor)
+        return GLib.SOURCE_REMOVE
+
+    def add_photos(self, photos: list[Path]):
+        self.deck.add(photos)
 
     def on_resize(self, *_):
         if self.position < 0:
@@ -178,15 +247,18 @@ class Slideshow(Gtk.Window):
         if self.resize_id:
             GLib.source_remove(self.resize_id)
             self.resize_id = 0
+        if self.countdown_id:
+            GLib.source_remove(self.countdown_id)
+            self.countdown_id = 0
 
     def render(self, paths: list[Path]):
         for child in self.grid.get_children():
             self.grid.remove(child)
         allocation = self.get_allocation()
-        columns = 2 if self.count == 4 else 1
-        rows = 2 if self.count == 4 else 1
-        cell_width = max(100, allocation.width // columns - 8)
-        cell_height = max(100, allocation.height // rows - 8)
+        columns = self.columns
+        rows = self.rows
+        cell_width = max(80, (allocation.width - (columns - 1) * 4) // columns)
+        cell_height = max(80, (allocation.height - (rows - 1) * 4) // rows)
         self.last_render_size = render_size(allocation.width, allocation.height)
         for index, path in enumerate(paths):
             frame = Gtk.EventBox()
@@ -197,7 +269,6 @@ class Slideshow(Gtk.Window):
                 image = Gtk.Label(label=f"No se pudo abrir:\n{path.name}")
                 image.override_color(Gtk.StateFlags.NORMAL, Gdk.RGBA(1, 1, 1, 1))
             frame.add(image)
-            frame.set_tooltip_text(str(path))
             self.grid.attach(frame, index % columns, index // columns, 1, 1)
         self.grid.show_all()
 
@@ -258,6 +329,7 @@ class PresentadorApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
         self.window: Gtk.ApplicationWindow | None = None
+        self.slideshow: Slideshow | None = None
 
     def do_activate(self):
         if self.window:
@@ -269,7 +341,7 @@ class PresentadorApp(Gtk.Application):
             saved = {}
         today = dt.date.today()
         self.window = Gtk.ApplicationWindow(application=self, title="Presentador Fotos NAS")
-        self.window.set_default_size(680, 565)
+        self.window.set_default_size(680, 400)
         self.window.set_icon_name("image-x-generic")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=13, margin=22)
         self.window.add(box)
@@ -288,23 +360,16 @@ class PresentadorApp(Gtk.Application):
         box.pack_start(source_row, False, False, 0)
 
         year_row = Gtk.Box(spacing=10)
-        year_row.pack_start(Gtk.Label(label="Año:"), False, False, 0)
-        self.year = Gtk.SpinButton.new_with_range(1900, 2100, 1)
-        self.year.set_value(saved.get("year", today.year))
-        year_row.pack_start(self.year, False, False, 0)
-        all_months = Gtk.Button(label="Todos los meses")
-        all_months.connect("clicked", lambda _: [item.set_active(True) for item in self.months])
-        year_row.pack_end(all_months, False, False, 0)
+        legacy_year = int(saved.get("year", today.year))
+        year_row.pack_start(Gtk.Label(label="Desde el año:"), False, False, 0)
+        self.year_from = Gtk.SpinButton.new_with_range(1900, 2100, 1)
+        self.year_from.set_value(saved.get("year_from", legacy_year))
+        year_row.pack_start(self.year_from, False, False, 0)
+        year_row.pack_start(Gtk.Label(label="Hasta el año (incluido):"), False, False, 0)
+        self.year_to = Gtk.SpinButton.new_with_range(1900, 2100, 1)
+        self.year_to.set_value(saved.get("year_to", legacy_year))
+        year_row.pack_start(self.year_to, False, False, 0)
         box.pack_start(year_row, False, False, 0)
-
-        month_grid = Gtk.Grid(column_spacing=24, row_spacing=10)
-        self.months: list[Gtk.CheckButton] = []
-        for index, name in enumerate(MONTHS):
-            checkbox = Gtk.CheckButton(label=name)
-            checkbox.set_active(index + 1 in saved.get("months", [today.month]))
-            self.months.append(checkbox)
-            month_grid.attach(checkbox, index % 3, index // 3, 1, 1)
-        box.pack_start(month_grid, False, False, 0)
 
         options = Gtk.Box(spacing=24)
         options.pack_start(Gtk.Label(label="Segundos por pase:"), False, False, 0)
@@ -312,13 +377,25 @@ class PresentadorApp(Gtk.Application):
         self.duration.set_digits(1)
         self.duration.set_value(max(2, float(saved.get("duration", 5))))
         options.pack_start(self.duration, False, False, 0)
-        self.four = Gtk.CheckButton(label="Mostrar 4 fotos a la vez")
-        self.four.set_active(bool(saved.get("four", False)))
-        options.pack_start(self.four, False, False, 0)
+        options.pack_start(Gtk.Label(label="Modo:"), False, False, 0)
+        self.mode = Gtk.ComboBoxText()
+        for mode_id, (label, _columns, _rows) in DISPLAY_MODES.items():
+            self.mode.append(mode_id, label)
+        saved_mode = saved.get("mode", "grid2x2")
+        self.mode.set_active_id(saved_mode if saved_mode in DISPLAY_MODES else "grid2x2")
+        options.pack_start(self.mode, False, False, 0)
         box.pack_start(options, False, False, 0)
 
+        timer_row = Gtk.Box(spacing=10)
+        timer_row.pack_start(Gtk.Label(label="Parar automáticamente tras:"), False, False, 0)
+        self.session_minutes = Gtk.SpinButton.new_with_range(1, 720, 1)
+        self.session_minutes.set_value(max(1, int(saved.get("session_minutes", 60))))
+        timer_row.pack_start(self.session_minutes, False, False, 0)
+        timer_row.pack_start(Gtk.Label(label="minutos (1 hora por defecto)"), False, False, 0)
+        box.pack_start(timer_row, False, False, 0)
+
         box.pack_start(Gtk.Label(label="Modo ligero: imágenes adaptadas a pantalla y recursos limitados.", xalign=0), False, False, 0)
-        self.status = Gtk.Label(label="Selecciona año y meses y pulsa Iniciar presentación.", xalign=0)
+        self.status = Gtk.Label(label="Selecciona el intervalo de años y pulsa Iniciar presentación.", xalign=0)
         self.status.set_line_wrap(True)
         box.pack_start(self.status, True, True, 0)
         self.play = Gtk.Button(label="▶ Iniciar presentación")
@@ -330,6 +407,8 @@ class PresentadorApp(Gtk.Application):
         version.get_style_context().add_class("dim-label")
         box.pack_start(version, False, False, 0)
         self.window.show_all()
+        if os.environ.get("PRESENTADOR_AUTOSTART") == "1":
+            GLib.timeout_add(700, self.prepare, None)
 
     def choose_folder(self, _button):
         dialog = Gtk.FileChooserDialog(
@@ -344,16 +423,18 @@ class PresentadorApp(Gtk.Application):
         dialog.destroy()
 
     def prepare(self, _button):
-        months = {index + 1 for index, item in enumerate(self.months) if item.get_active()}
-        if not months:
-            self.status.set_text("Selecciona al menos un mes.")
+        year_from = self.year_from.get_value_as_int()
+        year_to = self.year_to.get_value_as_int()
+        if year_from > year_to:
+            self.status.set_text("El año inicial no puede ser posterior al año final.")
             return
         self.selection = {
             "source": self.source.get_text().strip(),
-            "year": self.year.get_value_as_int(),
-            "months": sorted(months),
+            "year_from": year_from,
+            "year_to": year_to,
             "duration": self.duration.get_value(),
-            "four": self.four.get_active(),
+            "mode": self.mode.get_active_id() or "grid2x2",
+            "session_minutes": self.session_minutes.get_value_as_int(),
         }
         self.play.set_sensitive(False)
         self.status.set_text("Conectando con el NAS…")
@@ -379,35 +460,68 @@ class PresentadorApp(Gtk.Application):
             self.error("La carpeta no está disponible. Ábrela en Archivos y vuelve a intentarlo.")
             return
         selection = self.selection.copy()
-        self.status.set_text("Buscando todas las fotos válidas de los meses seleccionados…")
+        self.status.set_text("Indexando todo el intervalo antes de barajar…")
 
         def worker():
             try:
-                photos = selected_photos(Path(path), selection["year"], set(selection["months"]))
-                GLib.idle_add(self.start_slideshow, photos, selection)
+                photos: list[Path] = []
+                for photo in iter_selected_photos(Path(path), selection["year_from"], selection["year_to"]):
+                    photos.append(photo)
+                # No comenzar con lotes parciales: os.walk descubre las carpetas
+                # en orden y eso producia bloques visualmente cronologicos. Igual
+                # que el presentador original de Windows, primero se obtiene el
+                # conjunto completo y despues RandomDeck lo baraja globalmente.
+                GLib.idle_add(self.scan_complete, photos, selection)
             except Exception as error:  # El error se muestra en la interfaz.
                 GLib.idle_add(self.error, str(error))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def scan_complete(self, photos, selection):
+        if not photos:
+            return self.error("No se encontraron fotos con ‘copia’ o ‘ENC’ en ese intervalo de años.")
+        self.status.set_text(f"Índice completo: {len(photos)} fotos. Barajando…")
+        return self.start_slideshow(photos, selection)
 
     def error(self, message):
         self.status.set_text(message)
         self.play.set_sensitive(True)
         return GLib.SOURCE_REMOVE
 
+    def accept_scan_batch(self, photos, selection):
+        if self.slideshow is None:
+            self.start_slideshow(photos, selection)
+        else:
+            self.slideshow.add_photos(photos)
+        return GLib.SOURCE_REMOVE
+
+    def finish_scan(self, total):
+        if not total:
+            return self.error("No se encontraron fotos con ‘copia’ o ‘ENC’ en ese intervalo de años.")
+        self.status.set_text(f"Índice terminado: {total} fotos disponibles.")
+        self.play.set_sensitive(True)
+        return GLib.SOURCE_REMOVE
+
     def start_slideshow(self, photos, selection):
-        if not photos:
-            return self.error("No se encontraron fotos con ‘copia’ o ‘ENC’ para ese año y esos meses.")
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(selection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        self.status.set_text(f"Encontradas {len(photos)} fotos. Presentación iniciada.")
+        self.status.set_text("Reserva aleatoria preparada. El resto se indexa en segundo plano.")
         self.play.set_sensitive(True)
-        Slideshow(photos, selection["duration"], 4 if selection["four"] else 1)
+        self.window.hide()
+        self.slideshow = Slideshow(
+            self, photos, selection["duration"], selection["mode"], selection["session_minutes"]
+        )
+        self.slideshow.connect("destroy", self.slideshow_closed)
         return GLib.SOURCE_REMOVE
+
+    def slideshow_closed(self, *_):
+        self.slideshow = None
+        self.window.show_all()
+        self.window.present()
 
 
 def cli_scan(args) -> int:
-    photos = selected_photos(args.scan_only, args.year, set(args.months))
+    photos = selected_photos(args.scan_only, args.year_from, args.year_to)
     print(f"PresentadorFotos NAS v{APP_VERSION}: {len(photos)} fotos")
     for path in photos:
         print(path)
@@ -417,8 +531,8 @@ def cli_scan(args) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=f"PresentadorFotos NAS v{APP_VERSION}")
     parser.add_argument("--scan-only", type=Path, help="Escanea una ruta local sin abrir la interfaz")
-    parser.add_argument("--year", type=int, default=dt.date.today().year)
-    parser.add_argument("--months", type=int, nargs="+", default=list(range(1, 13)))
+    parser.add_argument("--year-from", type=int, default=dt.date.today().year)
+    parser.add_argument("--year-to", type=int, default=dt.date.today().year)
     args = parser.parse_args()
     if args.scan_only:
         return cli_scan(args)

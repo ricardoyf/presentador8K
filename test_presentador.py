@@ -35,13 +35,22 @@ class PresentadorTests(unittest.TestCase):
             ]
             for path in good + [root / "2024/02 Febrero/tres copia.jpg", root / "2024/01 Enero/a/no.jpg"]:
                 path.touch()
-            self.assertEqual(set(selected_photos(root, 2024, {1})), set(good))
+            self.assertEqual(set(selected_photos(root, 2024, 2024)), set(good + [root / "2024/02 Febrero/tres copia.jpg"]))
 
     def test_baraja_no_repite_antes_de_agotar(self):
         photos = [Path(str(index)) for index in range(10)]
         deck = RandomDeck(photos, random.Random(7))
         first = deck.draw(4) + deck.draw(4) + deck.draw(2)
         self.assertEqual(len(set(first)), 10)
+
+    def test_mosaico_sin_duplicados_ni_repeticion_inmediata(self):
+        photos = [Path(str(index)) for index in range(20)]
+        deck = RandomDeck(photos, random.Random(7))
+        first = deck.draw(4)
+        second = deck.draw(4)
+        self.assertEqual(len(set(first)), 4)
+        self.assertEqual(len(set(second)), 4)
+        self.assertTrue(set(first).isdisjoint(second))
 
     def test_render_no_supera_limite_de_recursos(self):
         self.assertEqual(render_size(7680, 4320), (MAX_RENDER_WIDTH, MAX_RENDER_HEIGHT))
