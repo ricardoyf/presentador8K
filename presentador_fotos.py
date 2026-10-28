@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import json
 import os
 from pathlib import Path
+import queue
 import random
 import re
 import sys
@@ -22,7 +24,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 APP_ID = "local.ricardo.PresentadorFotosNAS"
 DEFAULT_URI = "smb://dsplay214.local/photo/"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "presentador-fotos/config.json"
@@ -66,7 +68,7 @@ def photo_year_month(path: Path, root: Path) -> tuple[int, int] | None:
 
 
 def iter_selected_photos(root: Path, year_from: int, year_to: int):
-    """Entrega fotos a medida que aparecen, sin esperar a recorrer todo el NAS."""
+    """Indexa cada año en paralelo para reducir la latencia del NAS."""
     def scan_error(error: OSError) -> None:
         raise error
 
@@ -76,17 +78,35 @@ def iter_selected_photos(root: Path, year_from: int, year_to: int):
     scan_roots = [path for path in scan_roots if path.is_dir()]
     if not scan_roots:
         scan_roots = [root]
-    seen: set[Path] = set()
-    for scan_root in scan_roots:
+    results: queue.Queue[Path | None] = queue.Queue(maxsize=4000)
+
+    def scan_one(scan_root: Path) -> None:
         for base, _, files in os.walk(scan_root, onerror=scan_error):
             for name in files:
                 path = Path(base) / name
-                if path in seen or path.suffix.lower() not in PHOTO_EXTS or not NAME_FILTER.search(path.stem):
+                if path.suffix.lower() not in PHOTO_EXTS or not NAME_FILTER.search(path.stem):
                     continue
                 stamp = photo_year_month(path, root)
                 if stamp and year_from <= stamp[0] <= year_to:
-                    seen.add(path)
-                    yield path
+                    results.put(path)
+        results.put(None)
+
+    # El cuello de botella es la espera de red, no la CPU. Un trabajador por
+    # año permite que el NAS responda a varias carpetas simultáneamente.
+    workers = min(8, len(scan_roots))
+    seen: set[Path] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(scan_one, scan_root) for scan_root in scan_roots]
+        finished = 0
+        while finished < len(futures):
+            path = results.get()
+            if path is None:
+                finished += 1
+            elif path not in seen:
+                seen.add(path)
+                yield path
+        for future in futures:
+            future.result()
 
 
 def selected_photos(root: Path, year_from: int, year_to: int) -> list[Path]:
@@ -465,13 +485,22 @@ class PresentadorApp(Gtk.Application):
         def worker():
             try:
                 photos: list[Path] = []
+                total = 0
+                started = False
                 for photo in iter_selected_photos(Path(path), selection["year_from"], selection["year_to"]):
                     photos.append(photo)
-                # No comenzar con lotes parciales: os.walk descubre las carpetas
-                # en orden y eso producia bloques visualmente cronologicos. Igual
-                # que el presentador original de Windows, primero se obtiene el
-                # conjunto completo y despues RandomDeck lo baraja globalmente.
-                GLib.idle_add(self.scan_complete, photos, selection)
+                    total += 1
+                    threshold = 12 if not started else 100
+                    if len(photos) >= threshold:
+                        random.shuffle(photos)
+                        GLib.idle_add(self.accept_scan_batch, photos.copy(), selection)
+                        photos.clear()
+                        started = True
+                if photos:
+                    random.shuffle(photos)
+                    GLib.idle_add(self.accept_scan_batch, photos.copy(), selection)
+                    started = True
+                GLib.idle_add(self.finish_scan, total)
             except Exception as error:  # El error se muestra en la interfaz.
                 GLib.idle_add(self.error, str(error))
 
