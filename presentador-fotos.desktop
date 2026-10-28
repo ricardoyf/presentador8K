@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Presentador Fotos NAS
-Comment=Pase aleatorio de fotos copia o ENC por año y mes
+Comment=Pase aleatorio de fotos copia o ENC por intervalo de años
 Exec=@BIN_DIR@/presentador-fotos
 Icon=image-x-generic
 Terminal=false
