@@ -1,4 +1,4 @@
-# PresentadorFotos NAS v2.4
+# PresentadorFotos NAS v2.5
 
 Presentador de fotos para Ubuntu y Windows pensado para la biblioteca del NAS de Ricardo.
 
@@ -28,6 +28,13 @@ Presentador de fotos para Ubuntu y Windows pensado para la biblioteca del NAS de
 ## Comportamiento de la v2.4
 
 Los años se indexan en paralelo. El pase comienza al disponer de una reserva inicial y los lotes posteriores se incorporan ya barajados, reduciendo la espera del NAS sin recorrer los años secuencialmente.
+
+## Índice persistente de la v2.5
+
+- Guarda localmente el catálogo de fotos del NAS; no copia ni modifica imágenes.
+- Recupera inmediatamente las fotos de cualquier intervalo inclusivo de años.
+- **Crear nuevo índice** vuelve a recorrer la fototeca únicamente cuando se añaden o eliminan fotos.
+- Si todavía no existe índice, conserva el arranque progresivo de la v2.4.
 
 ## Instalacion
 

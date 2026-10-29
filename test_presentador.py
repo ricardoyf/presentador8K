@@ -11,6 +11,8 @@ from presentador_fotos import (
     photo_year_month,
     render_size,
     selected_photos,
+    load_photo_index,
+    save_photo_index,
 )
 
 
@@ -55,6 +57,22 @@ class PresentadorTests(unittest.TestCase):
     def test_render_no_supera_limite_de_recursos(self):
         self.assertEqual(render_size(7680, 4320), (MAX_RENDER_WIDTH, MAX_RENDER_HEIGHT))
         self.assertEqual(render_size(800, 600), (800, 600))
+
+    def test_indice_persistente_conserva_ano(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            photo = root / "2024/03 Marzo/imagen ENC.jpg"
+            photo.parent.mkdir(parents=True)
+            photo.touch()
+            import presentador_fotos
+            previous = presentador_fotos.INDEX_FILE
+            presentador_fotos.INDEX_FILE = root / "indice.json"
+            try:
+                save_photo_index("file:///fotos", root, [photo])
+                rows = load_photo_index("file:///fotos")
+            finally:
+                presentador_fotos.INDEX_FILE = previous
+            self.assertEqual(rows[0]["year"], 2024)
 
 
 if __name__ == "__main__":
