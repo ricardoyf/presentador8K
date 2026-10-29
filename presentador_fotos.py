@@ -24,10 +24,11 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk
 
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 APP_ID = "local.ricardo.PresentadorFotosNAS"
 DEFAULT_URI = "smb://dsplay214.local/photo/"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "presentador-fotos/config.json"
+INDEX_FILE = CONFIG.with_name("indice-fotos.json")
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
 MAX_RENDER_WIDTH = 1920
 MAX_RENDER_HEIGHT = 1080
@@ -112,6 +113,27 @@ def iter_selected_photos(root: Path, year_from: int, year_to: int):
 def selected_photos(root: Path, year_from: int, year_to: int) -> list[Path]:
     """Compatibilidad con el modo de diagnostico por consola."""
     return list(iter_selected_photos(root, year_from, year_to))
+
+
+def save_photo_index(source: str, root: Path, photos: list[Path]) -> None:
+    rows = []
+    for photo in photos:
+        stamp = photo_year_month(photo, root)
+        if stamp:
+            rows.append({"path": str(photo), "year": stamp[0], "month": stamp[1]})
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    temporary = INDEX_FILE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"source": source, "created": dt.datetime.now().isoformat(),
+                                     "photos": rows}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(INDEX_FILE)
+
+
+def load_photo_index(source: str) -> list[dict] | None:
+    try:
+        data = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data.get("photos") if data.get("source") == source else None
 
 
 class RandomDeck:
@@ -350,6 +372,7 @@ class PresentadorApp(Gtk.Application):
         super().__init__(application_id=APP_ID)
         self.window: Gtk.ApplicationWindow | None = None
         self.slideshow: Slideshow | None = None
+        self.rebuild_index = False
 
     def do_activate(self):
         if self.window:
@@ -418,10 +441,15 @@ class PresentadorApp(Gtk.Application):
         self.status = Gtk.Label(label="Selecciona el intervalo de años y pulsa Iniciar presentación.", xalign=0)
         self.status.set_line_wrap(True)
         box.pack_start(self.status, True, True, 0)
+        buttons = Gtk.Box(spacing=10)
+        self.index_button = Gtk.Button(label="⟳ Crear nuevo índice")
+        self.index_button.connect("clicked", self.prepare_index)
+        buttons.pack_start(self.index_button, False, False, 0)
         self.play = Gtk.Button(label="▶ Iniciar presentación")
         self.play.get_style_context().add_class("suggested-action")
         self.play.connect("clicked", self.prepare)
-        box.pack_start(self.play, False, False, 0)
+        buttons.pack_end(self.play, False, False, 0)
+        box.pack_start(buttons, False, False, 0)
         box.pack_start(Gtk.Label(label="Durante el pase: Espacio pausa · ←/→ navegan · Esc sale", xalign=0), False, False, 0)
         version = Gtk.Label(label=f"Versión {APP_VERSION}", xalign=1)
         version.get_style_context().add_class("dim-label")
@@ -456,7 +484,24 @@ class PresentadorApp(Gtk.Application):
             "mode": self.mode.get_active_id() or "grid2x2",
             "session_minutes": self.session_minutes.get_value_as_int(),
         }
+        self.rebuild_index = False
+        self.connect_source()
+
+    def prepare_index(self, _button):
+        self.selection = {
+            "source": self.source.get_text().strip(),
+            "year_from": self.year_from.get_value_as_int(),
+            "year_to": self.year_to.get_value_as_int(),
+            "duration": self.duration.get_value(),
+            "mode": self.mode.get_active_id() or "grid2x2",
+            "session_minutes": self.session_minutes.get_value_as_int(),
+        }
+        self.rebuild_index = True
+        self.connect_source()
+
+    def connect_source(self):
         self.play.set_sensitive(False)
+        self.index_button.set_sensitive(False)
         self.status.set_text("Conectando con el NAS…")
         source = Gio.File.new_for_commandline_arg(self.selection["source"])
         if source.get_uri_scheme() == "file":
@@ -480,6 +525,27 @@ class PresentadorApp(Gtk.Application):
             self.error("La carpeta no está disponible. Ábrela en Archivos y vuelve a intentarlo.")
             return
         selection = self.selection.copy()
+        cached = None if self.rebuild_index else load_photo_index(selection["source"])
+        if cached is not None:
+            photos = [Path(row["path"]) for row in cached
+                      if selection["year_from"] <= int(row["year"]) <= selection["year_to"]]
+            if not photos:
+                self.error("El índice no contiene fotos para esos años. Si añadiste fotos, pulsa Crear nuevo índice.")
+                return
+            self.status.set_text(f"Índice recuperado: {len(photos)} fotos. Iniciando…")
+            self.start_slideshow(photos, selection)
+            return
+        if self.rebuild_index:
+            self.status.set_text("Creando el índice completo de fotos. Puede tardar; solo hazlo cuando añadas archivos.")
+            def index_worker():
+                try:
+                    photos = list(iter_selected_photos(Path(path), 1900, 2100))
+                    save_photo_index(selection["source"], Path(path), photos)
+                    GLib.idle_add(self.index_finished, len(photos))
+                except Exception as error:
+                    GLib.idle_add(self.error, str(error))
+            threading.Thread(target=index_worker, daemon=True).start()
+            return
         self.status.set_text("Indexando todo el intervalo antes de barajar…")
 
         def worker():
@@ -506,6 +572,12 @@ class PresentadorApp(Gtk.Application):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def index_finished(self, total):
+        self.status.set_text(f"Nuevo índice creado: {total} fotos. Las próximas reproducciones serán inmediatas.")
+        self.play.set_sensitive(True)
+        self.index_button.set_sensitive(True)
+        return GLib.SOURCE_REMOVE
+
     def scan_complete(self, photos, selection):
         if not photos:
             return self.error("No se encontraron fotos con ‘copia’ o ‘ENC’ en ese intervalo de años.")
@@ -515,6 +587,7 @@ class PresentadorApp(Gtk.Application):
     def error(self, message):
         self.status.set_text(message)
         self.play.set_sensitive(True)
+        self.index_button.set_sensitive(True)
         return GLib.SOURCE_REMOVE
 
     def accept_scan_batch(self, photos, selection):
@@ -529,6 +602,7 @@ class PresentadorApp(Gtk.Application):
             return self.error("No se encontraron fotos con ‘copia’ o ‘ENC’ en ese intervalo de años.")
         self.status.set_text(f"Índice terminado: {total} fotos disponibles.")
         self.play.set_sensitive(True)
+        self.index_button.set_sensitive(True)
         return GLib.SOURCE_REMOVE
 
     def start_slideshow(self, photos, selection):
@@ -536,6 +610,7 @@ class PresentadorApp(Gtk.Application):
         CONFIG.write_text(json.dumps(selection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.status.set_text("Reserva aleatoria preparada. El resto se indexa en segundo plano.")
         self.play.set_sensitive(True)
+        self.index_button.set_sensitive(True)
         self.window.hide()
         self.slideshow = Slideshow(
             self, photos, selection["duration"], selection["mode"], selection["session_minutes"]
